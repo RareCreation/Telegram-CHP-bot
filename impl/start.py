@@ -44,10 +44,49 @@ async def start_handler(message: Message):
         inline_keyboard=[
             [InlineKeyboardButton(text="✉️ Письмо", callback_data="send_email")],
             [InlineKeyboardButton(text="📖 Инструкция", callback_data="show_instructions")],
-            [InlineKeyboardButton(text="🟢 Check Online", callback_data="online_status")]
+            [InlineKeyboardButton(text="🟢 Check Online", callback_data="online_status")],
+            [InlineKeyboardButton(text="📋 Check List", callback_data="check_list")]
         ]
     )
     await message.answer("Выбери одну из функций:", reply_markup=keyboard)
+
+
+
+@dp.callback_query(F.data == "check_list")
+async def check_list_handler(callback: CallbackQuery):
+    tg_id = callback.from_user.id
+    conn = sqlite3.connect('tracking.db')
+    cursor = conn.cursor()
+    cursor.execute('SELECT steam_id, comment, last_status FROM tracking WHERE tg_id = ?', (tg_id,))
+    rows = cursor.fetchall()
+    conn.close()
+
+    if not rows:
+        await callback.message.edit_text(
+            "📋 У тебя пока нет отслеживаемых мамонтов.",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_main")]
+                ]
+            )
+        )
+        return
+
+    text = "📋 Мамонты:\n\n"
+    for i, (steam_id, comment, last_status) in enumerate(rows, start=1):
+        text += (f"🆔 <code>{steam_id}</code>\n"
+                 f"💬 {comment}\n"
+                 f"🔵 Статус: {last_status}\n\n")
+
+    await callback.message.edit_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_main")]
+            ]
+        ),
+        parse_mode="HTML"
+    )
 
 
 @dp.callback_query(F.data == "send_email")
@@ -175,8 +214,8 @@ async def handle_online_status_link(message: Message, state: FSMContext):
     cursor.execute('SELECT COUNT(*) FROM tracking WHERE tg_id = ?', (tg_id,))
     count = cursor.fetchone()[0]
 
-    if count >= 10:
-        await message.answer("❌ Вы достигли лимита отслеживаемых профилей (10).")
+    if count >= 20:
+        await message.answer("❌ Вы достигли лимита отслеживаемых профилей (20).")
         await state.clear()
         return
 
@@ -216,7 +255,8 @@ async def back_to_main(callback: CallbackQuery):
         inline_keyboard=[
             [InlineKeyboardButton(text="✉️ Письмо", callback_data="send_email")],
             [InlineKeyboardButton(text="📖 Инструкция", callback_data="show_instructions")],
-            [InlineKeyboardButton(text="🟢 Check Online", callback_data="online_status")]
+            [InlineKeyboardButton(text="🟢 Check Online", callback_data="online_status")],
+            [InlineKeyboardButton(text="📋 Check List", callback_data="check_list")]
         ]
     )
     await callback.message.edit_text("Выбери одну из функций:", reply_markup=keyboard)
