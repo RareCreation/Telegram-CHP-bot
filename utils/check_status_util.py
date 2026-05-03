@@ -1,67 +1,109 @@
 import asyncio
-import sqlite3
-
-import requests
-from bs4 import BeautifulSoup
+import aiohttp
 
 from handlers.bot_instance import bot
+from settings.config import STEAM_API_KEY
+from utils.database import check_tracking_exists, get_tracking_status, update_tracking_status
+from utils.logger_util import logger
+
+
+tracking_tasks = {}
+
+async def fetch_status(steam_id: str):
+    try:
+        url = "https://api.steampowered.com/ISteamUser/GetPlayerSummaries/v2/"
+        params = {"key": STEAM_API_KEY, "steamids": steam_id}
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params) as resp:
+                data = await resp.json()
+
+        players = data.get("response", {}).get("players", [])
+        if not players:
+            logger.warning(f"No player data for {steam_id}")
+            return None
+
+        return players[0].get("personastate", 0)
+
+    except Exception as e:
+        logger.error(f"fetch_status error {steam_id}: {e}")
+        return None
+
+
+def map_status(state: int):
+    return "Currently Online" if state == 1 else "Currently Offline"
 
 
 async def check_status(tg_id: int, steam_id: str, comment: str):
-    url = f"https://steamcommunity.com/profiles/{steam_id}/"
-    last_status = None
+    logger.info(f"Started tracking tg_id={tg_id} steam_id={steam_id}")
 
     while True:
         try:
-            conn = sqlite3.connect('tracking.db')
-            cursor = conn.cursor()
-
-            cursor.execute('SELECT 1 FROM tracking WHERE tg_id = ? AND steam_id = ?', (tg_id, steam_id))
-            if not cursor.fetchone():
+            if not check_tracking_exists(tg_id, steam_id):
+                logger.info(f"Stopped tracking (DB removed) {steam_id}")
                 break
 
-            headers = {"User-Agent": "Mozilla/5.0"}
-            response = requests.get(url, headers=headers)
-            soup = BeautifulSoup(response.text, "html.parser")
+            state = await fetch_status(steam_id)
 
-            persona_name_element = soup.find("span", class_="actual_persona_name")
-            persona_name = persona_name_element.text.strip() if persona_name_element else "Неизвестный пользователь"
+            if state is None:
+                logger.warning(f"State is None for {steam_id}")
+                await asyncio.sleep(30)
+                continue
 
-            status_element = soup.find("div", class_="profile_in_game_header")
-            current_status = status_element.text.strip() if status_element else "Currently Offline"
+            if state == 1:
+                simplified_status = "online"
+            elif state == 3:
+                simplified_status = "away"
+            elif state == 0:
+                state2 = await fetch_status(steam_id)
 
-            simplified_status = "Currently Online" if "in-game" in current_status.lower() or "online" in current_status.lower() else "Currently Offline"
+                if state2 == 3:
+                    simplified_status = "away"
+                else:
+                    simplified_status = "offline"
+            else:
+                simplified_status = "offline"
 
-            cursor.execute('SELECT last_status FROM tracking WHERE tg_id = ? AND steam_id = ?', (tg_id, steam_id))
-            row = cursor.fetchone()
-            db_last_status = row[0] if row else None
+            db_last_status = get_tracking_status(tg_id, steam_id)
+
+            logger.info(f"{steam_id} state={state} -> {simplified_status}")
 
             if db_last_status != simplified_status:
-                cursor.execute('UPDATE tracking SET last_status = ? WHERE tg_id = ? AND steam_id = ?',
-                               (simplified_status, tg_id, steam_id))
-                conn.commit()
+                update_tracking_status(tg_id, steam_id, simplified_status)
 
-                if simplified_status == "Currently Online":
-                    message = (
-                        "🟢 Мамонт зашёл в сеть\n\n"
-                        f"🪪 {persona_name}\n"
-                        f"💬 \"{comment}\"\n"
-                        f"📎 {url}"
-                    )
+                url = f"https://steamcommunity.com/profiles/{steam_id}/"
+
+                if simplified_status == "online":
+                    text = "🟢 Мамонт зашёл в сеть\n\n"
+                elif simplified_status == "away":
+                    text = "🟡 Мамонт отошёл (Away)\n\n"
                 else:
-                    message = (
-                        "🔴 Мамонт вышел из сети\n\n"
-                        f"🪪 {persona_name}\n"
-                        f"💬 \"{comment}\"\n"
-                        f"📎 {url}"
-                    )
+                    text = "🔴 Мамонт вышел из сети\n\n"
 
-                await bot.send_message(tg_id, message)
+                text += f"💬 {comment}\n📎 {url}"
+
+                await bot.send_message(tg_id, text)
+
+                logger.info(f"Status change sent to tg_id={tg_id}")
 
             await asyncio.sleep(30)
 
         except Exception as e:
-            print(f"[ERROR] Ошибка при проверке статуса: {e}")
+            logger.error(f"check_status loop error {steam_id}: {e}")
             await asyncio.sleep(60)
-        finally:
-            conn.close()
+
+
+async def restore_tracking():
+    import sqlite3
+
+    conn = sqlite3.connect("tracking.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT tg_id, steam_id, comment FROM tracking")
+    rows = cursor.fetchall()
+    conn.close()
+
+    logger.info(f"Restoring tracking tasks: {len(rows)}")
+
+    for tg_id, steam_id, comment in rows:
+        task = asyncio.create_task(check_status(tg_id, steam_id, comment))
+        tracking_tasks[(tg_id, steam_id)] = task
